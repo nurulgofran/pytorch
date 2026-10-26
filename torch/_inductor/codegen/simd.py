@@ -2275,21 +2275,47 @@ class _GroupedReductionOpsHandler(WrapperHandler):  # type: ignore[type-arg]
         value: CSEVariable,
     ) -> CSEVariable:
         """Reshape the parent-full tile and reduce over the local reduction."""
+        from .triton import triton_type, upcast_acc_dtype, upcast_compute_type
+
         k = self._kernel
         value = self._layout.ensure_parent_tile_resolution(k, value)
         # The grouped-reduction reshape uses the grouped-axis named constants
         # from the reduced-output family, so emit the derived headers before
         # we materialize the reshape line.
         self._family.ensure_headers(k)
-        reshaped = k.emit_reshape(value, self._layout.reshape_shape, src_dtype)
+        if value.dtype is None:
+            raise AssertionError("value must have a known dtype")
+        # Like TritonKernel.reduction, [b]float16 always reduces in float32, even
+        # when codegen_upcast_to_fp32 leaves the loaded tile in half precision.
+        acc_dtype = upcast_acc_dtype(src_dtype)
+        if value.dtype in (torch.float16, torch.bfloat16):
+            value = k.cse.generate(
+                k.compute,
+                f"{value}.to(tl.float32)",
+                dtype=torch.float32,
+                shape=value.shape,
+            )
+            acc_dtype = torch.float32
+        reshaped = k.emit_reshape(value, self._layout.reshape_shape, value.dtype)
         k.num_reduction += 1
-        return k.emit_reduce(
+        result = k.emit_reduce(
             reshaped,
             reduction_type,
             self._layout.reduce_axis,
-            dtype,
+            acc_dtype,
             self._layout.output_shape,
         )
+        # As in TritonKernel.reduction, hand the result back in the compute type
+        # of its dtype (half precision when codegen_upcast_to_fp32 is off).
+        compute_dtype = upcast_compute_type(dtype)
+        if dtype in (torch.float16, torch.bfloat16) and result.dtype != compute_dtype:
+            result = k.cse.generate(
+                k.compute,
+                f"{result}.to({triton_type(compute_dtype)})",
+                dtype=compute_dtype,
+                shape=result.shape,
+            )
+        return result
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
         remapped_index = self._family.remap_index(index)
